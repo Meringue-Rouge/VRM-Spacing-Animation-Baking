@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VRM-Spacing-Animation-Baking",
     "author": "ingenoire",
-    "version": (1, 9, 8),
+    "version": (2, 0, 0),
     "blender": (2, 80, 0),
     "location": "View3D > Sidebar > VRM Bake",
     "description": "Adjusts spacing for VRM bones and provides animation baking tools.",
@@ -10,14 +10,21 @@ bl_info = {
 
 import bpy
 import math
+import mathutils
+
+tracked_changes = {}
+is_tracking = False  # Global flag to determine if we're recording
 
 # List of bone pairs for dropdown menu
 bone_pairs = [
     ("SHOULDER", "J_Bip_L_Shoulder", "J_Bip_R_Shoulder", "Shoulder", True),
     ("UPPER_ARM", "J_Bip_L_UpperArm", "J_Bip_R_UpperArm", "Upper Arm", True),
     ("LOWER_ARM", "J_Bip_L_LowerArm", "J_Bip_R_LowerArm", "Lower Arm", True),
+    ("HANDS", "J_Bip_L_Hand", "J_Bip_R_Hand", "Hands", True),
     ("UPPER_LEG", "J_Bip_L_UpperLeg", "J_Bip_R_UpperLeg", "Upper Leg", True),
     ("LOWER_LEG", "J_Bip_L_LowerLeg", "J_Bip_R_LowerLeg", "Lower Leg", True),
+    ("FEET", "J_Bip_L_Foot", "J_Bip_R_Foot", "Feet", True),
+    ("TOES", "J_Bip_L_ToeBase", "J_Bip_R_ToeBase", "Tip of Feet / Toes", True),
     ("SPINE", "J_Bip_C_Spine", None, "Spine", False),
     ("CHEST", "J_Bip_C_Chest", None, "Chest", False),
     ("UPPER_CHEST", "J_Bip_C_UpperChest", None, "Upper Chest", False),
@@ -357,9 +364,210 @@ class LoopifyPhysicsOperator(bpy.types.Operator):
 
         return {'FINISHED'}
 
+# ----------------------- Track Pose Changes -----------------------
+
+def track_pose_changes(scene):
+    """Tracks changes in Pose Mode for selected bones only when recording is active."""
+    global tracked_changes, is_tracking
+
+    if not is_tracking:
+        return  # Stop tracking if not in recording mode
+
+    armature = bpy.context.object
+    if not armature or armature.type != 'ARMATURE':
+        return
+
+    try:
+        for bone in armature.pose.bones:
+            if not bone.bone.select:  # Only track selected bones
+                continue
+
+            bone_name = bone.name
+
+            # Initialize tracking for the selected bone
+            if bone_name not in tracked_changes:
+                tracked_changes[bone_name] = {
+                    "original_location": bone.location.copy(),
+                    "original_rotation": bone.rotation_quaternion.copy() if bone.rotation_mode == 'QUATERNION' else bone.rotation_euler.to_quaternion(),
+                    "original_scale": bone.scale.copy(),
+                    "delta_location": mathutils.Vector((0, 0, 0)),
+                    "delta_rotation": mathutils.Quaternion((1, 0, 0, 0)),  # Identity quaternion
+                    "delta_scale": mathutils.Vector((0, 0, 0)),
+                    "has_changes": False  # Flag to check if bone has changed
+                }
+                continue  # Skip computing deltas on the first frame
+
+            # Compute deltas (change from original pose)
+            original = tracked_changes[bone_name]
+
+            delta_loc = bone.location - original["original_location"]
+            
+            # Convert Euler to Quaternion if needed
+            current_rot = bone.rotation_quaternion if bone.rotation_mode == 'QUATERNION' else bone.rotation_euler.to_quaternion()
+            # Invert the delta rotation to fix flipping
+            delta_rot = current_rot.rotation_difference(original["original_rotation"]).inverted()
+
+            delta_scale = bone.scale - original["original_scale"]
+
+            # Store deltas only if there is meaningful change
+            if delta_loc.length > 0.0001 or delta_rot.angle > 0.0001 or delta_scale.length > 0.0001:
+                tracked_changes[bone_name]["delta_location"] = delta_loc
+                tracked_changes[bone_name]["delta_rotation"] = delta_rot
+                tracked_changes[bone_name]["delta_scale"] = delta_scale
+                tracked_changes[bone_name]["has_changes"] = True
+
+    except Exception as e:
+        print(f"Error in pose tracking: {e}")
 
 
-# Example UI Panel code snippet for adding new controls
+# ----------------------- Start Tracking -----------------------
+
+class StartListeningOperator(bpy.types.Operator):
+    """Starts tracking pose transformations for selected bones"""
+    bl_idname = "pose.start_listening"
+    bl_label = "Start Tracking Pose Changes"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        global tracked_changes, is_tracking
+
+        if bpy.context.object and bpy.context.object.type == 'ARMATURE':
+            if bpy.context.mode != 'POSE':
+                bpy.ops.object.mode_set(mode='POSE')
+        else:
+            self.report({'ERROR'}, "No active armature found.")
+            return {'CANCELLED'}
+
+        tracked_changes = {}  # Clear previous tracking
+        is_tracking = True  # Activate tracking
+
+        if track_pose_changes not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(track_pose_changes)
+
+        context.scene.is_tracking_pose_changes = True
+        self.report({'INFO'}, "Started tracking pose changes.")
+        return {'FINISHED'}
+
+
+class CancelTrackingOperator(bpy.types.Operator):
+    """Cancels pose tracking and clears recorded changes"""
+    bl_idname = "pose.cancel_tracking"
+    bl_label = "Cancel Tracking"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        global tracked_changes, is_tracking
+
+        is_tracking = False
+        tracked_changes.clear()  # Clear recorded data
+
+        if track_pose_changes in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(track_pose_changes)
+
+        context.scene.is_tracking_pose_changes = False
+        self.report({'INFO'}, "Tracking canceled.")
+        return {'FINISHED'}
+
+
+
+
+# ----------------------- Apply Tracked Changes -----------------------
+
+class ApplyTrackedChangesOperator(bpy.types.Operator):
+    """Applies the recorded transformations to selected keyframes for selected bones."""
+    bl_idname = "pose.apply_tracked_changes"
+    bl_label = "Apply Tracked Changes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        # Show popup message to guide the user
+        self.report(
+            {'INFO'},
+            "Please select a range of frames in the timeline, adjust the necessary bones "
+            "(translation, rotation, scaling), and then apply the changes."
+        )
+        return self.execute(context)
+
+    def execute(self, context):
+        global tracked_changes, is_tracking
+        armature = bpy.context.object
+
+        if not tracked_changes:
+            self.report({'WARNING'}, "No changes tracked.")
+            return {'CANCELLED'}
+
+        if not armature or armature.type != 'ARMATURE' or not armature.animation_data or not armature.animation_data.action:
+            self.report({'ERROR'}, "No active armature or animation data found.")
+            return {'CANCELLED'}
+
+        action = armature.animation_data.action
+        selected_keyframes = get_selected_keyframes(action)
+
+        if not selected_keyframes:
+            self.report({'WARNING'}, "No keyframes selected.")
+            return {'CANCELLED'}
+
+        try:
+            for frame in selected_keyframes:
+                bpy.context.scene.frame_set(frame)  # Set the current frame
+
+                for bone_name, changes in tracked_changes.items():
+                    if not changes["has_changes"]:  # Skip unchanged bones
+                        continue
+
+                    if bone_name in armature.pose.bones:
+                        bone = armature.pose.bones[bone_name]
+
+                        # Apply stored deltas to the current bone state at the keyframe
+                        bone.location += changes["delta_location"]
+                        bone.keyframe_insert(data_path="location", frame=frame)
+
+                        if bone.rotation_mode == 'QUATERNION':
+                            bone.rotation_quaternion = bone.rotation_quaternion @ changes["delta_rotation"]
+                            bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+                        else:
+                            current_quat = bone.rotation_euler.to_quaternion()
+                            new_quat = current_quat @ changes["delta_rotation"]
+                            bone.rotation_euler = new_quat.to_euler(bone.rotation_mode)
+                            bone.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+                        bone.scale += changes["delta_scale"]
+                        bone.keyframe_insert(data_path="scale", frame=frame)
+
+            # Rebake keyframes for proper interpolation
+            bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.mode_set(mode='POSE')
+
+        except Exception as e:
+            print(f"Error applying tracked changes: {e}")
+
+        # Clear tracked changes after applying
+        tracked_changes.clear()
+        is_tracking = False
+        context.scene.is_tracking_pose_changes = False
+
+        if track_pose_changes in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(track_pose_changes)
+
+        self.report({'INFO'}, "Applied changes to selected keyframes.")
+        return {'FINISHED'}
+
+
+
+# ----------------------- Utility Function -----------------------
+
+def get_selected_keyframes(action):
+    """Returns a sorted list of selected keyframes"""
+    selected_frames = set()
+    for fcurve in action.fcurves:
+        for keyframe in fcurve.keyframe_points:
+            if keyframe.select_control_point:
+                selected_frames.add(int(keyframe.co.x))
+    return sorted(selected_frames)
+
+
+
+
 class SpacingPanel(bpy.types.Panel):
     bl_label = "VRM Space Anime Baking"
     bl_idname = "OBJECT_PT_spacing"
@@ -387,6 +595,18 @@ class SpacingPanel(bpy.types.Panel):
         layout.operator("object.adjust_spacing", text="Adjust Spacing", icon='MODIFIER')
 
         layout.separator(factor=0.5)
+        
+        is_tracking = context.scene.is_tracking_pose_changes
+
+        layout.label(text="Track & Apply Pose Changes", icon='ARMATURE_DATA')
+
+        if not is_tracking:
+            layout.operator("pose.start_listening", text="Start Tracking", icon='TRACKING')
+        else:
+            layout.operator("pose.cancel_tracking", text="Cancel Tracking", icon='CANCEL')
+            layout.label(text="Tracking in Progress...", icon='TIME')
+            # Show "Apply Changes" button only when tracking is active
+            layout.operator("pose.apply_tracked_changes", text="Apply Changes", icon='KEY_HLT')
 
         # ------------------- Animation Helper Section -------------------
         layout.label(text="Animation Helper", icon='ANIM')
@@ -423,6 +643,16 @@ def register():
     bpy.utils.register_class(AdjustPlaybackAndBakeOperator)
     bpy.utils.register_class(ToggleVRMSpringBonePhysicsOperator)
     bpy.utils.register_class(LoopifyPhysicsOperator)
+    
+    bpy.utils.register_class(StartListeningOperator)
+    bpy.utils.register_class(CancelTrackingOperator)
+    bpy.utils.register_class(ApplyTrackedChangesOperator)
+
+    bpy.types.Scene.is_tracking_pose_changes = bpy.props.BoolProperty(
+        name="Is Tracking Pose Changes",
+        description="Indicates if pose tracking is active",
+        default=False
+    )
 
     bpy.types.Scene.selected_bone_pair = bpy.props.EnumProperty(
         name="Bone Pair",
@@ -488,6 +718,12 @@ def unregister():
     bpy.utils.unregister_class(AdjustPlaybackAndBakeOperator)
     bpy.utils.unregister_class(ToggleVRMSpringBonePhysicsOperator)
     bpy.utils.unregister_class(LoopifyPhysicsOperator)
+    
+    bpy.utils.unregister_class(StartListeningOperator)
+    bpy.utils.unregister_class(CancelTrackingOperator)
+    bpy.utils.unregister_class(ApplyTrackedChangesOperator)
+
+    del bpy.types.Scene.is_tracking_pose_changes
 
     del bpy.types.Scene.selected_bone_pair
     del bpy.types.Scene.affect_left_prop
