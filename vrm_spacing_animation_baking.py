@@ -1,7 +1,7 @@
 bl_info = {
     "name": "VRM-Spacing-Animation-Baking",
-    "author": "ingenoire",
-    "version": (2, 0, 0),
+    "author": "Meringue Rouge",
+    "version": (2, 0, 5),
     "blender": (2, 80, 0),
     "location": "View3D > Sidebar > VRM Bake",
     "description": "Adjusts spacing for VRM bones and provides animation baking tools.",
@@ -44,6 +44,19 @@ bpy.types.Scene.spacing_axis = bpy.props.EnumProperty(
     default='SIDEWAYS'
 )
 
+def get_action_curves(action, datablock):
+    if hasattr(action, 'fcurves'):
+        return action.fcurves
+    elif hasattr(action, 'layers') and action.layers:
+        layer = action.layers[0]
+        if layer.strips:
+            strip = layer.strips[0]
+            slot = datablock.animation_data.action_slot
+            channelbag = strip.channelbag(slot, ensure=False)
+            if channelbag:
+                return channelbag.fcurves
+    return None
+
 # Updated bone pair spacing function
 def adjust_bone_pair_spacing(armature, bone_l_name, bone_r_name, space_value, affect_left, affect_right, axis):
     if not affect_left and not affect_right:
@@ -53,6 +66,9 @@ def adjust_bone_pair_spacing(armature, bone_l_name, bone_r_name, space_value, af
     anim_data = armature.animation_data
 
     if anim_data is not None and anim_data.action is not None:
+        curves_coll = get_action_curves(anim_data.action, armature)
+        if curves_coll is None:
+            return {'FINISHED'}
         for f in range(int(anim_data.action.frame_range[0]), int(anim_data.action.frame_range[1]) + 1):
             bpy.context.scene.frame_set(f)
 
@@ -66,14 +82,14 @@ def adjust_bone_pair_spacing(armature, bone_l_name, bone_r_name, space_value, af
 
             if affect_left and bone_l_name in armature.pose.bones:
                 bone_l = armature.pose.bones[bone_l_name]
-                fcurve = anim_data.action.fcurves.find(data_path=f"pose.bones[\"{bone_l_name}\"].rotation_euler", index=axis_index)
+                fcurve = curves_coll.find(data_path=f"pose.bones[\"{bone_l_name}\"].rotation_euler", index=axis_index)
                 if fcurve and any(kp.co[0] == f for kp in fcurve.keyframe_points):
                     bone_l.rotation_euler[axis_index] += space_rad
                     bone_l.keyframe_insert(data_path="rotation_euler", index=axis_index)
 
             if affect_right and bone_r_name and bone_r_name in armature.pose.bones:
                 bone_r = armature.pose.bones[bone_r_name]
-                fcurve = anim_data.action.fcurves.find(data_path=f"pose.bones[\"{bone_r_name}\"].rotation_euler", index=axis_index)
+                fcurve = curves_coll.find(data_path=f"pose.bones[\"{bone_r_name}\"].rotation_euler", index=axis_index)
                 if fcurve and any(kp.co[0] == f for kp in fcurve.keyframe_points):
                     bone_r.rotation_euler[axis_index] -= space_rad
                     bone_r.keyframe_insert(data_path="rotation_euler", index=axis_index)
@@ -168,6 +184,11 @@ class DeleteHighlightedBonesOperator(bpy.types.Operator):
             self.report({'WARNING'}, "No animation data found.")
             return {'CANCELLED'}
 
+        curves_coll = get_action_curves(anim_data.action, armature)
+        if curves_coll is None:
+            self.report({'WARNING'}, "No curves collection found.")
+            return {'CANCELLED'}
+
         selected_bones = [bone.name for bone in armature.pose.bones if bone.bone.select]
 
         if not selected_bones:
@@ -176,9 +197,9 @@ class DeleteHighlightedBonesOperator(bpy.types.Operator):
 
         # Loop through selected bones and remove keyframes for all transformations
         for bone_name in selected_bones:
-            fcurves = [fc for fc in anim_data.action.fcurves if fc.data_path.startswith(f'pose.bones["{bone_name}"]')]
+            fcurves = [fc for fc in curves_coll if fc.data_path.startswith(f'pose.bones["{bone_name}"]')]
             for fcurve in fcurves:
-                anim_data.action.fcurves.remove(fcurve)
+                curves_coll.remove(fcurve)
 
         return {'FINISHED'}
 
@@ -290,6 +311,11 @@ class LoopifyPhysicsOperator(bpy.types.Operator):
             return {'CANCELLED'}
 
         action = anim_data.action
+        curves_coll = get_action_curves(action, armature)
+        if curves_coll is None:
+            self.report({'ERROR'}, "No curves collection found.")
+            return {'CANCELLED'}
+
         frame_range = action.frame_range
         start_frame = int(frame_range[0])
         end_frame = int(frame_range[1])
@@ -328,7 +354,7 @@ class LoopifyPhysicsOperator(bpy.types.Operator):
         # Helper function to get F-Curves for selected bones
         def get_selected_bone_fcurves():
             fcurves = []
-            for fcurve in action.fcurves:
+            for fcurve in curves_coll:
                 if any(bone_name in fcurve.data_path for bone_name in selected_bones):
                     fcurves.append(fcurve)
             return fcurves
@@ -352,7 +378,7 @@ class LoopifyPhysicsOperator(bpy.types.Operator):
 
         # Insert keyframes at the paste position
         for fcurve in fcurves:
-            for frame, value in keyframe_data[fcurve].items():
+            for frame, value in keyframe_data.get(fcurve, {}).items():
                 fcurve.keyframe_points.insert(paste_frame, value, options={'FAST'})
 
         # Re-delete the original delete range to clear any additional frames
@@ -366,7 +392,7 @@ class LoopifyPhysicsOperator(bpy.types.Operator):
 
 # ----------------------- Track Pose Changes -----------------------
 
-def track_pose_changes(scene):
+def track_pose_changes(scene, depsgraph):
     """Tracks changes in Pose Mode for selected bones only when recording is active."""
     global tracked_changes, is_tracking
 
@@ -404,8 +430,8 @@ def track_pose_changes(scene):
             
             # Convert Euler to Quaternion if needed
             current_rot = bone.rotation_quaternion if bone.rotation_mode == 'QUATERNION' else bone.rotation_euler.to_quaternion()
-            # Invert the delta rotation to fix flipping
-            delta_rot = current_rot.rotation_difference(original["original_rotation"]).inverted()
+            # Compute delta rotation
+            delta_rot = current_rot.rotation_difference(original["original_rotation"])
 
             delta_scale = bone.scale - original["original_scale"]
 
@@ -483,7 +509,7 @@ class ApplyTrackedChangesOperator(bpy.types.Operator):
         # Show popup message to guide the user
         self.report(
             {'INFO'},
-            "Please select a range of frames in the timeline, adjust the necessary bones "
+            "Please select keyframes in the Dope Sheet or Graph Editor, adjust the necessary bones "
             "(translation, rotation, scaling), and then apply the changes."
         )
         return self.execute(context)
@@ -501,12 +527,14 @@ class ApplyTrackedChangesOperator(bpy.types.Operator):
             return {'CANCELLED'}
 
         action = armature.animation_data.action
-        selected_keyframes = get_selected_keyframes(action)
+        curves_coll = get_action_curves(action, armature)
+        selected_keyframes = get_selected_keyframes(curves_coll)
 
         if not selected_keyframes:
             self.report({'WARNING'}, "No keyframes selected.")
             return {'CANCELLED'}
 
+        applied = False
         try:
             for frame in selected_keyframes:
                 bpy.context.scene.frame_set(frame)  # Set the current frame
@@ -523,16 +551,18 @@ class ApplyTrackedChangesOperator(bpy.types.Operator):
                         bone.keyframe_insert(data_path="location", frame=frame)
 
                         if bone.rotation_mode == 'QUATERNION':
-                            bone.rotation_quaternion = bone.rotation_quaternion @ changes["delta_rotation"]
+                            bone.rotation_quaternion = changes["delta_rotation"] @ bone.rotation_quaternion
                             bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
                         else:
                             current_quat = bone.rotation_euler.to_quaternion()
-                            new_quat = current_quat @ changes["delta_rotation"]
+                            new_quat = changes["delta_rotation"] @ current_quat
                             bone.rotation_euler = new_quat.to_euler(bone.rotation_mode)
                             bone.keyframe_insert(data_path="rotation_euler", frame=frame)
 
                         bone.scale += changes["delta_scale"]
                         bone.keyframe_insert(data_path="scale", frame=frame)
+
+                        applied = True
 
             # Rebake keyframes for proper interpolation
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -549,20 +579,25 @@ class ApplyTrackedChangesOperator(bpy.types.Operator):
         if track_pose_changes in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.remove(track_pose_changes)
 
-        self.report({'INFO'}, "Applied changes to selected keyframes.")
+        if applied:
+            self.report({'INFO'}, "Applied changes to selected keyframes.")
+        else:
+            self.report({'INFO'}, "No significant changes detected.")
         return {'FINISHED'}
 
 
 
 # ----------------------- Utility Function -----------------------
 
-def get_selected_keyframes(action):
+def get_selected_keyframes(curves_coll):
     """Returns a sorted list of selected keyframes"""
+    if curves_coll is None:
+        return []
     selected_frames = set()
-    for fcurve in action.fcurves:
+    for fcurve in curves_coll:
         for keyframe in fcurve.keyframe_points:
             if keyframe.select_control_point:
-                selected_frames.add(int(keyframe.co.x))
+                selected_frames.add(int(keyframe.co[0]))
     return sorted(selected_frames)
 
 
